@@ -1,4 +1,4 @@
-const formidable = require('formidable');
+const { formidable } = require('formidable');
 const fs = require('fs');
 
 // Vercel needs raw body (multipart), so disable the default JSON body parser.
