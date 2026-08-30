@@ -94,7 +94,7 @@
       <div class="icon">🎧</div>
       <div>ចុច ឬអូសឯកសារ mp3 មកទីនេះ</div>
       <div class="filename" id="filename"></div>
-      <input type="file" id="fileInput" accept="audio/*" />
+      <input type="file" id="fileInput" accept=".mp3,audio/mpeg" />
     </div>
     <p class="hint">ឯកសារគួរតូចជាង ៤ MB (Vercel Free) — សម្រាប់ clip ខ្លីៗ ២-៣ នាទី</p>
     <button id="submitBtn" disabled>បំលែងឥឡូវនេះ</button>
@@ -134,6 +134,24 @@ fileInput.addEventListener('change', () => {
 });
 
 function setFile(file) {
+  const isMp3 = /\.mp3$/i.test(file.name) || file.type === 'audio/mpeg' || file.type === 'audio/mp3';
+
+  if (!isMp3) {
+    errorEl.textContent = 'សូម upload តែឯកសារ .mp3 ប៉ុណ្ណោះ (ឯកសារ video ដូចជា .mp4 មិនអាចប្រើបានទេ)';
+    filenameEl.textContent = '';
+    submitBtn.disabled = true;
+    selectedFile = null;
+    return;
+  }
+
+  if (file.size > 4.4 * 1024 * 1024) {
+    errorEl.textContent = `ឯកសារធំពេក (${(file.size / 1024 / 1024).toFixed(2)} MB) — Vercel Free កំណត់ត្រឹមប្រហែល 4.4 MB សូមកាត់ clip ឲ្យខ្លីជាងនេះ`;
+    filenameEl.textContent = '';
+    submitBtn.disabled = true;
+    selectedFile = null;
+    return;
+  }
+
   selectedFile = file;
   filenameEl.textContent = `${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)`;
   submitBtn.disabled = false;
