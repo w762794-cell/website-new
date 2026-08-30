@@ -136,7 +136,8 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const apiKey = (process.env.GROQ_API_KEY || '').trim();
+  let apiKey = (process.env.GROQ_API_KEY || '').replace(/[\s\u00A0\u200B-\u200D\uFEFF]/g, '');
+  apiKey = apiKey.replace(/[^A-Za-z0-9_\-]/g, '');
   if (!apiKey) {
     return res
       .status(500)
@@ -277,6 +278,9 @@ export default async function handler(req, res) {
       })),
     });
   } catch (err) {
-    return res.status(500).json({ error: err.message || 'មានបញ្ហាមិនស្គាល់មូលហេតុកើតឡើង' });
+    const hint = /did not match the expected pattern/i.test(err.message || '')
+      ? ' (GROQ_API_KEY ប្រហែលជានៅមានតួអក្សរលាក់ខាងក្នុង — សូមលុបចោល ហើយវាយបញ្ចូល key ដោយផ្ទាល់ដៃម្តងទៀត ជំនួសការ copy-paste)'
+      : '';
+    return res.status(500).json({ error: (err.message || 'មានបញ្ហាមិនស្គាល់មូលហេតុកើតឡើង') + hint });
   }
 }
