@@ -1,0 +1,9 @@
+{
+  "name": "khmer-subtitle-website",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Upload a Chinese-story mp3, get Khmer subtitles (.srt) synced to the audio.",
+  "dependencies": {
+    "formidable": "^3.5.1"
+  }
+}
