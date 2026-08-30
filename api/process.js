@@ -22,7 +22,7 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const apiKey = process.env.GROQ_API_KEY;
+  const apiKey = (process.env.GROQ_API_KEY || '').trim();
   if (!apiKey) {
     return res
       .status(500)
@@ -37,6 +37,12 @@ export default async function handler(req, res) {
 
     if (!file) {
       return res.status(400).json({ error: 'មិនមានឯកសារសំឡេងត្រូវបានផ្ញើមកទេ' });
+    }
+
+    const nameLooksLikeMp3 = /\.mp3$/i.test(file.originalFilename || '');
+    const typeLooksLikeMp3 = (file.mimetype || '').includes('audio');
+    if (!nameLooksLikeMp3 && !typeLooksLikeMp3) {
+      return res.status(400).json({ error: 'សូម upload តែឯកសារ .mp3 ប៉ុណ្ណោះ (ឯកសារ video ដូចជា .mp4 មិនអាចប្រើបានទេ)' });
     }
 
     // ---- Step 1: Transcribe Chinese speech with Groq's hosted Whisper ----
