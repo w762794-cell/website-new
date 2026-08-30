@@ -1,5 +1,9 @@
 const { formidable } = require('formidable');
 const fs = require('fs');
+const { spawn } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
+
+const SAMPLE_RATE = 24000; // mono 16-bit PCM working format for all internal audio math
 
 // Vercel needs raw body (multipart), so disable the default JSON body parser.
 export const config = {
@@ -27,7 +31,6 @@ function splitTextForTTS(text, maxBytes = 180) {
     current = '';
   };
 
-  // Try to split on sentence-ish punctuation / spaces first, else fall back to hard slicing.
   const pieces = text.split(/([។៕!?.\s])/).filter(Boolean);
 
   for (const piece of pieces) {
@@ -37,7 +40,6 @@ function splitTextForTTS(text, maxBytes = 180) {
         pushCurrent();
         current = piece;
       } else {
-        // Single piece itself too long (no spaces) — hard slice by bytes.
         let rest = piece;
         while (Buffer.byteLength(rest, 'utf8') > maxBytes) {
           let sliceLen = maxBytes;
@@ -60,7 +62,7 @@ function splitTextForTTS(text, maxBytes = 180) {
   return chunks.length ? chunks : [text];
 }
 
-// Fetch one chunk of Khmer speech audio from Google Translate's unofficial TTS endpoint.
+// Fetch one chunk of Khmer speech audio (mp3 bytes) from Google Translate's unofficial TTS endpoint.
 async function fetchTTSChunk(text) {
   const url =
     'https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=km&q=' +
@@ -82,19 +84,63 @@ async function fetchTTSChunk(text) {
   return Buffer.from(arrayBuffer);
 }
 
-// Turn a full Khmer sentence into one concatenated mp3 Buffer (chunked internally if needed).
-async function synthesizeKhmer(text) {
+// Turn a full Khmer sentence into one concatenated raw mp3 Buffer (chunked internally if needed).
+async function synthesizeKhmerMp3(text) {
   const chunks = splitTextForTTS(text);
   const buffers = [];
   for (const chunk of chunks) {
-    // Sequential per-chunk to stay polite to the free endpoint and preserve order.
     const buf = await fetchTTSChunk(chunk);
     buffers.push(buf);
   }
   return Buffer.concat(buffers);
 }
 
-// Run async tasks with limited concurrency, preserving input order in the result array.
+// Run an ffmpeg (static binary) process, feeding `input` to stdin and collecting stdout as a Buffer.
+function runFfmpeg(args, input) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(ffmpegPath, args);
+    const outChunks = [];
+    let stderr = '';
+
+    proc.stdout.on('data', (d) => outChunks.push(d));
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`ffmpeg exited with code ${code}: ${stderr.slice(-500)}`));
+      } else {
+        resolve(Buffer.concat(outChunks));
+      }
+    });
+
+    proc.stdin.on('error', () => {}); // ignore EPIPE if ffmpeg exits early
+    proc.stdin.write(input);
+    proc.stdin.end();
+  });
+}
+
+// Decode an mp3 Buffer into raw mono 16-bit PCM at SAMPLE_RATE.
+async function decodeMp3ToPcm(mp3Buffer) {
+  return runFfmpeg(
+    ['-i', 'pipe:0', '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', String(SAMPLE_RATE), '-ac', '1', 'pipe:1'],
+    mp3Buffer
+  );
+}
+
+// Encode raw mono 16-bit PCM at SAMPLE_RATE into an mp3 Buffer.
+async function encodePcmToMp3(pcmBuffer) {
+  return runFfmpeg(
+    ['-f', 's16le', '-ar', String(SAMPLE_RATE), '-ac', '1', '-i', 'pipe:0', '-codec:a', 'libmp3lame', '-b:a', '64k', '-f', 'mp3', 'pipe:1'],
+    pcmBuffer
+  );
+}
+
+function silencePcm(seconds) {
+  if (seconds <= 0) return Buffer.alloc(0);
+  const numSamples = Math.round(seconds * SAMPLE_RATE);
+  return Buffer.alloc(numSamples * 2); // 16-bit = 2 bytes/sample, zero = silence
+}
+
 // Retry a fetch-returning function on Groq rate-limit (429) errors, honoring
 // the "try again in Xs" hint in the error body when present.
 async function fetchWithRetry(fn, maxRetries = 4) {
@@ -108,13 +154,13 @@ async function fetchWithRetry(fn, maxRetries = 4) {
     if (match) waitMs = Math.ceil(parseFloat(match[1]) * 1000) + 300;
 
     if (attempt === maxRetries) {
-      // Out of retries — reconstruct a fake response-like object with the body we already read.
       return { ok: false, status: 429, text: async () => bodyText };
     }
     await new Promise((r) => setTimeout(r, waitMs));
   }
 }
 
+// Run async tasks with limited concurrency, preserving input order in the result array.
 async function mapWithConcurrency(items, limit, fn) {
   const results = new Array(items.length);
   let nextIndex = 0;
@@ -244,26 +290,60 @@ export default async function handler(req, res) {
 
     // ---- Step 3: Build the .srt file (kept as a bonus download) ----
     let srt = '';
-    segments.forEach((idxSeg, idx) => {
-      const khmerText = translations[idxSeg.id] || idxSeg.text;
+    segments.forEach((seg, idx) => {
+      const khmerText = translations[seg.id] || seg.text;
       srt += `${idx + 1}\n`;
-      srt += `${formatTimestamp(idxSeg.start)} --> ${formatTimestamp(idxSeg.end)}\n`;
+      srt += `${formatTimestamp(seg.start)} --> ${formatTimestamp(seg.end)}\n`;
       srt += `${khmerText}\n\n`;
     });
 
-    // ---- Step 4: Synthesize Khmer speech for each segment, then stitch into one mp3 ----
-    const khmerTexts = segments.map((s) => (translations[s.id] || s.text).trim()).filter(Boolean);
+    // ---- Step 4: Synthesize Khmer speech per segment (mp3), decode each to raw PCM ----
+    const khmerTexts = segments.map((s) => (translations[s.id] || s.text).trim());
 
-    let audioBuffers;
+    let segmentPcms;
     try {
-      audioBuffers = await mapWithConcurrency(khmerTexts, 4, synthesizeKhmer);
+      segmentPcms = await mapWithConcurrency(khmerTexts, 4, async (text) => {
+        if (!text) return Buffer.alloc(0);
+        const mp3 = await synthesizeKhmerMp3(text);
+        return decodeMp3ToPcm(mp3);
+      });
     } catch (ttsErr) {
       return res.status(502).json({
         error: `កំហុសពេលបង្កើតសំឡេងខ្មែរ (TTS): ${ttsErr.message}. សូមសាកល្បងម្តងទៀត ឬប្រើ clip ខ្លីជាងនេះ`,
       });
     }
 
-    const finalAudioBuffer = Buffer.concat(audioBuffers);
+    // ---- Step 5: Lay segments onto a timeline matching the ORIGINAL Chinese timestamps ----
+    // Each Khmer clip is placed no earlier than its original segment's start time. If a clip
+    // runs longer than the gap to the next segment, following segments drift later to catch up
+    // once a big enough gap appears again (no audio is sped up or cut).
+    const parts = [];
+    let currentTime = 0;
+
+    segments.forEach((seg, idx) => {
+      const pcm = segmentPcms[idx];
+      if (pcm.length === 0) return;
+
+      const desiredStart = seg.start;
+      const gap = desiredStart - currentTime;
+      if (gap > 0.05) {
+        parts.push(silencePcm(gap));
+        currentTime += gap;
+      }
+
+      parts.push(pcm);
+      currentTime += pcm.length / (SAMPLE_RATE * 2);
+    });
+
+    const finalPcm = Buffer.concat(parts);
+
+    let finalAudioBuffer;
+    try {
+      finalAudioBuffer = await encodePcmToMp3(finalPcm);
+    } catch (encodeErr) {
+      return res.status(502).json({ error: `កំហុសពេលបង្កើតឯកសារ mp3 ចុងក្រោយ: ${encodeErr.message}` });
+    }
+
     const audioBase64 = finalAudioBuffer.toString('base64');
 
     return res.status(200).json({
