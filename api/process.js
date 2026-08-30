@@ -95,6 +95,26 @@ async function synthesizeKhmer(text) {
 }
 
 // Run async tasks with limited concurrency, preserving input order in the result array.
+// Retry a fetch-returning function on Groq rate-limit (429) errors, honoring
+// the "try again in Xs" hint in the error body when present.
+async function fetchWithRetry(fn, maxRetries = 4) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const res = await fn();
+    if (res.status !== 429) return res;
+
+    const bodyText = await res.text();
+    let waitMs = 2000 * (attempt + 1);
+    const match = bodyText.match(/try again in ([\d.]+)s/i);
+    if (match) waitMs = Math.ceil(parseFloat(match[1]) * 1000) + 300;
+
+    if (attempt === maxRetries) {
+      // Out of retries — reconstruct a fake response-like object with the body we already read.
+      return { ok: false, status: 429, text: async () => bodyText };
+    }
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
+}
+
 async function mapWithConcurrency(items, limit, fn) {
   const results = new Array(items.length);
   let nextIndex = 0;
@@ -168,7 +188,7 @@ export default async function handler(req, res) {
     }
 
     // ---- Step 2: Translate each segment (Chinese -> Khmer) in batches ----
-    const BATCH_SIZE = 25;
+    const BATCH_SIZE = 12;
     const translations = {};
 
     for (let i = 0; i < segments.length; i += BATCH_SIZE) {
@@ -184,18 +204,20 @@ export default async function handler(req, res) {
         'No explanation, no markdown fences, JSON only.\n\n' +
         `Input:\n${JSON.stringify(batch)}`;
 
-      const chatRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'openai/gpt-oss-120b',
-          messages: [{ role: 'user', content: prompt }],
-          temperature: 0.2,
-        }),
-      });
+      const chatRes = await fetchWithRetry(() =>
+        fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: 'openai/gpt-oss-120b',
+            messages: [{ role: 'user', content: prompt }],
+            temperature: 0.2,
+          }),
+        })
+      );
 
       if (!chatRes.ok) {
         const errText = await chatRes.text();
