@@ -17,6 +17,100 @@ function formatTimestamp(seconds) {
   return `${pad(h)}:${pad(m)}:${pad(s)},${pad(ms, 3)}`;
 }
 
+// Split Khmer text into chunks small enough for the TTS endpoint (byte-limited, not char-limited).
+function splitTextForTTS(text, maxBytes = 180) {
+  const chunks = [];
+  let current = '';
+
+  const pushCurrent = () => {
+    if (current.trim().length > 0) chunks.push(current.trim());
+    current = '';
+  };
+
+  // Try to split on sentence-ish punctuation / spaces first, else fall back to hard slicing.
+  const pieces = text.split(/([។៕!?.\s])/).filter(Boolean);
+
+  for (const piece of pieces) {
+    const candidate = current + piece;
+    if (Buffer.byteLength(candidate, 'utf8') > maxBytes) {
+      if (current) {
+        pushCurrent();
+        current = piece;
+      } else {
+        // Single piece itself too long (no spaces) — hard slice by bytes.
+        let rest = piece;
+        while (Buffer.byteLength(rest, 'utf8') > maxBytes) {
+          let sliceLen = maxBytes;
+          let slice = rest.slice(0, sliceLen);
+          while (Buffer.byteLength(slice, 'utf8') > maxBytes && sliceLen > 1) {
+            sliceLen -= 1;
+            slice = rest.slice(0, sliceLen);
+          }
+          chunks.push(slice);
+          rest = rest.slice(sliceLen);
+        }
+        current = rest;
+      }
+    } else {
+      current = candidate;
+    }
+  }
+  pushCurrent();
+
+  return chunks.length ? chunks : [text];
+}
+
+// Fetch one chunk of Khmer speech audio from Google Translate's unofficial TTS endpoint.
+async function fetchTTSChunk(text) {
+  const url =
+    'https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=km&q=' +
+    encodeURIComponent(text);
+
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      Referer: 'https://translate.google.com/',
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(`TTS endpoint failed (${res.status}) for chunk: "${text.slice(0, 20)}..."`);
+  }
+
+  const arrayBuffer = await res.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
+// Turn a full Khmer sentence into one concatenated mp3 Buffer (chunked internally if needed).
+async function synthesizeKhmer(text) {
+  const chunks = splitTextForTTS(text);
+  const buffers = [];
+  for (const chunk of chunks) {
+    // Sequential per-chunk to stay polite to the free endpoint and preserve order.
+    const buf = await fetchTTSChunk(chunk);
+    buffers.push(buf);
+  }
+  return Buffer.concat(buffers);
+}
+
+// Run async tasks with limited concurrency, preserving input order in the result array.
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const current = nextIndex++;
+      results[current] = await fn(items[current], current);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
@@ -85,7 +179,7 @@ export default async function handler(req, res) {
       const prompt =
         'You are a professional Chinese-to-Khmer subtitle translator. ' +
         'Translate the "text" field of each item below from Chinese to natural, fluent Khmer ' +
-        'suitable for TV/movie subtitles. Keep the same meaning, tone, and length appropriate for subtitles. ' +
+        'suitable for spoken narration. Keep the same meaning and tone. ' +
         'Return ONLY a JSON array, same order, same "id" values, each item shaped as {"id": <id>, "khmer": "<translation>"}. ' +
         'No explanation, no markdown fences, JSON only.\n\n' +
         `Input:\n${JSON.stringify(batch)}`;
@@ -97,7 +191,7 @@ export default async function handler(req, res) {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
+          model: 'openai/gpt-oss-120b',
           messages: [{ role: 'user', content: prompt }],
           temperature: 0.2,
         }),
@@ -125,17 +219,34 @@ export default async function handler(req, res) {
       }
     }
 
-    // ---- Step 3: Build the .srt file, timed to each segment ----
+    // ---- Step 3: Build the .srt file (kept as a bonus download) ----
     let srt = '';
-    segments.forEach((seg, idx) => {
-      const khmerText = translations[seg.id] || seg.text;
+    segments.forEach((idxSeg, idx) => {
+      const khmerText = translations[idxSeg.id] || idxSeg.text;
       srt += `${idx + 1}\n`;
-      srt += `${formatTimestamp(seg.start)} --> ${formatTimestamp(seg.end)}\n`;
+      srt += `${formatTimestamp(idxSeg.start)} --> ${formatTimestamp(idxSeg.end)}\n`;
       srt += `${khmerText}\n\n`;
     });
 
+    // ---- Step 4: Synthesize Khmer speech for each segment, then stitch into one mp3 ----
+    const khmerTexts = segments.map((s) => (translations[s.id] || s.text).trim()).filter(Boolean);
+
+    let audioBuffers;
+    try {
+      audioBuffers = await mapWithConcurrency(khmerTexts, 4, synthesizeKhmer);
+    } catch (ttsErr) {
+      return res.status(502).json({
+        error: `កំហុសពេលបង្កើតសំឡេងខ្មែរ (TTS): ${ttsErr.message}. សូមសាកល្បងម្តងទៀត ឬប្រើ clip ខ្លីជាងនេះ`,
+      });
+    }
+
+    const finalAudioBuffer = Buffer.concat(audioBuffers);
+    const audioBase64 = finalAudioBuffer.toString('base64');
+
     return res.status(200).json({
       srt,
+      audioBase64,
+      audioMimeType: 'audio/mpeg',
       segments: segments.map((s) => ({
         start: s.start,
         end: s.end,
