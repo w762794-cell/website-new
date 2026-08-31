@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>រឿងចិន → សំឡេងខ្មែរ</title>
+<title>រឿងចិន → Subtitle ខ្មែរ</title>
 <style>
   :root {
     --bg: #0f1115;
@@ -86,8 +86,8 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>រឿងចិន → សំឡេងខ្មែរ</h1>
-  <p class="sub">Upload ឯកសារ mp3 រឿងចិន ដើម្បីបំលែងជាសំឡេងនិយាយភាសាខ្មែរ (voice)</p>
+  <h1>រឿងចិន → Subtitle ខ្មែរ</h1>
+  <p class="sub">Upload ឯកសារ mp3 រឿងចិន ដើម្បីបំលែងជាអក្សររត់ខ្មែរ (.srt) ត្រូវតាមវិនាទី</p>
 
   <div class="card">
     <div class="drop" id="drop">
@@ -103,9 +103,7 @@
   </div>
 
   <div class="card" id="resultCard" style="display:none;">
-    <audio id="audioPlayer" controls style="width:100%; margin-bottom:14px;"></audio>
-    <a class="download" id="downloadAudioLink" download="khmer-voice.mp3">⬇️ ទាញយកសំឡេងខ្មែរ (.mp3)</a>
-    <a class="download" id="downloadLink" download="subtitle-km.srt" style="background:#3a3f4b; margin-top:10px;">⬇️ ទាញយក subtitle.srt (បន្ថែម)</a>
+    <a class="download" id="downloadLink" download="subtitle-km.srt">⬇️ ទាញយកឯកសារ subtitle.srt</a>
     <div class="segments" id="segments"></div>
   </div>
 </div>
@@ -120,8 +118,6 @@ const errorEl = document.getElementById('error');
 const resultCard = document.getElementById('resultCard');
 const segmentsEl = document.getElementById('segments');
 const downloadLink = document.getElementById('downloadLink');
-const audioPlayer = document.getElementById('audioPlayer');
-const downloadAudioLink = document.getElementById('downloadAudioLink');
 
 let selectedFile = null;
 
@@ -167,7 +163,7 @@ submitBtn.addEventListener('click', async () => {
   if (!selectedFile) return;
   submitBtn.disabled = true;
   errorEl.textContent = '';
-  statusEl.textContent = 'កំពុងស្តាប់សំឡេង បកប្រែជាខ្មែរ ហើយបង្កើតសំឡេងខ្មែរនិយាយ... សូមរង់ចាំ (អាចចំណាយពេលមួយពីរនាទី)';
+  statusEl.textContent = 'កំពុងបំលែងសំឡេងទៅជាអក្សរ និងបកប្រែជាភាសាខ្មែរ... សូមរង់ចាំ';
 
   const formData = new FormData();
   formData.append('audio', selectedFile);
@@ -181,19 +177,8 @@ submitBtn.addEventListener('click', async () => {
     }
 
     statusEl.textContent = 'រួចរាល់!';
-
-    // Khmer voice audio
-    const audioBytes = atob(data.audioBase64);
-    const audioArray = new Uint8Array(audioBytes.length);
-    for (let i = 0; i < audioBytes.length; i++) audioArray[i] = audioBytes.charCodeAt(i);
-    const audioBlob = new Blob([audioArray], { type: data.audioMimeType || 'audio/mpeg' });
-    const audioUrl = URL.createObjectURL(audioBlob);
-    audioPlayer.src = audioUrl;
-    downloadAudioLink.href = audioUrl;
-
-    // Bonus .srt
-    const srtBlob = new Blob([data.srt], { type: 'text/plain;charset=utf-8' });
-    downloadLink.href = URL.createObjectURL(srtBlob);
+    const blob = new Blob([data.srt], { type: 'text/plain;charset=utf-8' });
+    downloadLink.href = URL.createObjectURL(blob);
 
     segmentsEl.innerHTML = '';
     data.segments.forEach((seg) => {
