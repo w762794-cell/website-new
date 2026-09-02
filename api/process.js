@@ -40,6 +40,45 @@ function cleanEnvValue(v) {
   return (v || '').replace(/[\s\u00A0\u200B-\u200D\uFEFF]/g, '');
 }
 
+// Build subtitle lines from word-level timestamps: start a new line whenever there's a
+// silence gap between words, or when the current line gets too long (by time or characters).
+// This avoids stretching one subtitle line across a silent pause, and keeps lines short
+// enough to read comfortably (and to re-time cleanly if fed into TTS later).
+function buildLinesFromWords(words, opts = {}) {
+  const SILENCE_GAP = opts.silenceGap ?? 0.5; // seconds of silence that forces a line break
+  const MAX_DURATION = opts.maxDuration ?? 6; // seconds
+  const MAX_CHARS = opts.maxChars ?? 32; // characters (Chinese: ~1 char per syllable)
+
+  const lines = [];
+  let current = null;
+
+  for (const w of words) {
+    const word = (w.word || '').trim();
+    if (!word) continue;
+
+    if (current) {
+      const gap = w.start - current.end;
+      const wouldBeDuration = w.end - current.start;
+      const wouldBeChars = current.text.length + word.length;
+
+      if (gap > SILENCE_GAP || wouldBeDuration > MAX_DURATION || wouldBeChars > MAX_CHARS) {
+        lines.push(current);
+        current = null;
+      }
+    }
+
+    if (!current) {
+      current = { text: word, start: w.start, end: w.end };
+    } else {
+      current.text += word;
+      current.end = w.end;
+    }
+  }
+  if (current) lines.push(current);
+
+  return lines.map((l, idx) => ({ id: idx, text: l.text, start: l.start, end: l.end }));
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
@@ -77,6 +116,8 @@ export default async function handler(req, res) {
     whisperForm.append('model', 'whisper-large-v3');
     whisperForm.append('response_format', 'verbose_json');
     whisperForm.append('language', 'zh');
+    whisperForm.append('timestamp_granularities[]', 'segment');
+    whisperForm.append('timestamp_granularities[]', 'word');
     whisperForm.append('temperature', '0');
 
     const transcribeRes = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
@@ -91,11 +132,16 @@ export default async function handler(req, res) {
     }
 
     const transcription = await transcribeRes.json();
-    const segments = transcription.segments || [];
+    const rawSegments = transcription.segments || [];
+    const words = transcription.words || [];
 
-    if (segments.length === 0) {
+    if (rawSegments.length === 0) {
       return res.status(422).json({ error: 'រកមិនឃើញសំឡេងនិយាយនៅក្នុងឯកសារនេះទេ' });
     }
+
+    // Prefer word-level timing (avoids stretching a line across silence); fall back to
+    // Whisper's own coarser segments if word timestamps weren't returned for some reason.
+    const segments = words.length > 0 ? buildLinesFromWords(words) : rawSegments;
 
     // ---- Step 2: Translate each segment (Chinese -> Khmer) in batches ----
     const BATCH_SIZE = 12;
