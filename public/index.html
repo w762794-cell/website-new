@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<meta name='viewport' content='width=device-width, initial-scale=1'/><!DOCTYPE html>
 <html lang="km">
 <head>
 <meta charset="UTF-8" />
@@ -87,18 +87,18 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>រឿងចិន → Subtitle ខ្មែរ</h1>
-  <p class="sub">Upload ឯកសារ mp3 រឿងចិន ដើម្បីបំលែងជាអក្សររត់ខ្មែរ (.srt) ត្រូវតាមវិនាទី</p>
+  <h1> Nhaz Website </h1>
+  <p class="sub">Upload ឯកសារ mp3គ្រប់ភាសា ដើម្បីConvertជា File Srt ភាសាខ្មែរ</p>
 
   <div class="card">
     <div class="drop" id="drop">
       <div class="icon">🎧</div>
-      <div>ចុច ឬអូសឯកសារ mp3 មកទីនេះ</div>
+      <div>ចុចទីនេះដើម្បី upload mp3</div>
       <div class="filename" id="filename"></div>
       <input type="file" id="fileInput" accept=".mp3,audio/mpeg" />
     </div>
-    <p class="hint">ទទួលបានរហូតដល់ ~១៥-២០ នាទី (ប្រព័ន្ធនឹងបង្រួម audio ស្វ័យប្រវត្តិមុនផ្ញើ)</p>
-    <button id="submitBtn" disabled>បំលែងឥឡូវនេះ</button>
+    <p class="hint">អាច upload mp3 ដែលមានរយៈពេល3-4 នាទី</p>
+    <button id="submitBtn" disabled>Convert Now</button>
     <div class="status" id="status"></div>
     <div class="error" id="error"></div>
   </div>
@@ -210,14 +210,14 @@ submitBtn.addEventListener('click', async () => {
   try {
     uploadBlob = await compressAudioForUpload(selectedFile);
   } catch (compressErr) {
-    errorEl.textContent = 'កំហុសពេលបង្រួម audio: ' + compressErr.message + ' — សូមសាកល្បងឯកសារផ្សេង ឬខ្លីជាងនេះ';
+    errorEl.textContent = 'កំហុសពេលបង្រួម audio: ' + compressErr.message + ' -- សូមសាកល្បងឯកសារផ្សេង ឬខ្លីជាងនេះ';
     statusEl.textContent = '';
     submitBtn.disabled = false;
     return;
   }
 
   if (uploadBlob.size > 4.3 * 1024 * 1024) {
-    errorEl.textContent = `ទោះបីជាបង្រួមរួចហើយក៏ដោយ ឯកសារនៅតែធំពេក (${(uploadBlob.size / 1024 / 1024).toFixed(2)} MB) — សូមប្រើ clip ខ្លីជាងនេះ (ក្រោម ២០ នាទីប្រហែល)`;
+    errorEl.textContent = `ទោះបីជាបង្រួមរួចហើយក៏ដោយ ឯកសារនៅតែធំពេក (${(uploadBlob.size / 1024 / 1024).toFixed(2)} MB) -- សូមប្រើ clip ខ្លីជាងនេះ (ក្រោម ២០ នាទីប្រហែល)`;
     statusEl.textContent = '';
     submitBtn.disabled = false;
     return;
