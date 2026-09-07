@@ -40,160 +40,6 @@ function cleanEnvValue(v) {
   return (v || '').replace(/[\s\u00A0\u200B-\u200D\uFEFF]/g, '');
 }
 
-// Build short display lines from a set of word-level timestamps belonging to ONE sentence,
-// breaking whenever there's a silence gap or the line gets too long. Because this only ever
-// runs on the words of a single already-translated sentence, a split here never crosses a
-// sentence boundary — it's purely about keeping subtitle lines short and silence-aware.
-function buildLinesFromWords(words, opts = {}) {
-  const SILENCE_GAP = opts.silenceGap ?? 0.5;
-  const MAX_DURATION = opts.maxDuration ?? 6;
-  const MAX_CHARS = opts.maxChars ?? 32;
-
-  const lines = [];
-  let current = null;
-
-  for (const w of words) {
-    const word = (w.word || '').trim();
-    if (!word) continue;
-
-    if (current) {
-      const gap = w.start - current.end;
-      const wouldBeDuration = w.end - current.start;
-      const wouldBeChars = current.text.length + word.length;
-
-      if (gap > SILENCE_GAP || wouldBeDuration > MAX_DURATION || wouldBeChars > MAX_CHARS) {
-        lines.push(current);
-        current = null;
-      }
-    }
-
-    if (!current) {
-      current = { text: word, start: w.start, end: w.end };
-    } else {
-      current.text += word;
-      current.end = w.end;
-    }
-  }
-  if (current) lines.push(current);
-
-  return lines;
-}
-
-// Split a translated Khmer sentence across N sub-lines, proportionally to how long each
-// corresponding original-language sub-line was (approximate, but keeps lines roughly matched
-// to their share of the sentence instead of dumping the whole translation on the first line).
-function splitTranslationAcrossLines(khmerText, originalLineTexts) {
-  if (originalLineTexts.length <= 1) return [khmerText];
-
-  const totalOriginalLen = originalLineTexts.reduce((sum, t) => sum + t.length, 0) || 1;
-  const totalKhmerLen = khmerText.length;
-
-  const parts = [];
-  let consumed = 0;
-  for (let i = 0; i < originalLineTexts.length; i++) {
-    const isLast = i === originalLineTexts.length - 1;
-    if (isLast) {
-      parts.push(khmerText.slice(consumed).trim());
-      break;
-    }
-    const share = originalLineTexts[i].length / totalOriginalLen;
-    let take = Math.round(share * totalKhmerLen);
-    // Prefer breaking on a space if one exists near the cut point, for slightly cleaner splits.
-    let cut = consumed + take;
-    const spacePos = khmerText.indexOf(' ', cut);
-    if (spacePos !== -1 && spacePos - cut < 10) cut = spacePos;
-    cut = Math.min(cut, khmerText.length);
-    parts.push(khmerText.slice(consumed, cut).trim());
-    consumed = cut;
-  }
-  return parts.filter((p) => p.length > 0).length ? parts : [khmerText];
-}
-
-// Ask the model to translate one batch of {id, text} sentences to Khmer, returning a
-// map of id -> khmer. If the response is malformed/truncated/missing items, this recurses
-// on smaller sub-batches (down to 1 sentence at a time) until every id is covered.
-async function translateBatch(batch, contextTail, apiKey, depth = 0) {
-  const contextBlock =
-    contextTail.length > 0
-      ? 'Context — the last few sentences already translated earlier in this same story ' +
-        '(for continuity of names/tone only, do NOT re-translate or include these in your output):\n' +
-        contextTail.map((c) => `- 中文: ${c.zh}\n  ខ្មែរ: ${c.km}`).join('\n') +
-        '\n\n'
-      : '';
-
-  const prompt =
-    'You are a professional Chinese-to-Khmer subtitle translator working through one continuous story, ' +
-    'sentence by sentence, in order. Translate the "text" field of each item below from Chinese to natural, ' +
-    'fluent Khmer suitable for TV/movie subtitles. Preserve the actual meaning and narrative continuity of the ' +
-    'story (character names, who is speaking, pronouns, ongoing tone) — do not translate sentences as isolated, ' +
-    'unrelated fragments. Keep each translation reasonably close in length to the original, suitable for a subtitle line. ' +
-    `You MUST return exactly ${batch.length} item(s), one for every id listed, with no omissions.\n\n` +
-    contextBlock +
-    'Return ONLY a JSON array, same order, same "id" values, each item shaped as {"id": <id>, "khmer": "<translation>"}. ' +
-    'No explanation, no markdown fences, JSON only.\n\n' +
-    `Sentences to translate now:\n${JSON.stringify(batch)}`;
-
-  const chatRes = await fetchWithRetry(() =>
-    fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'openai/gpt-oss-120b',
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0.2,
-        max_tokens: 8000,
-      }),
-    })
-  );
-
-  let parsed = [];
-  if (chatRes.ok) {
-    const chatData = await chatRes.json();
-    let content = (chatData.choices?.[0]?.message?.content || '').trim();
-    content = content.replace(/^```json\s*/i, '').replace(/```$/, '').trim();
-    try {
-      parsed = JSON.parse(content);
-    } catch (e) {
-      const match = content.match(/\[[\s\S]*\]/);
-      if (match) {
-        try {
-          parsed = JSON.parse(match[0]);
-        } catch (e2) {
-          parsed = [];
-        }
-      }
-    }
-  }
-
-  const result = {};
-  for (const item of parsed) {
-    if (item && item.khmer) result[item.id] = item.khmer;
-  }
-
-  const missing = batch.filter((b) => !result[b.id]);
-
-  if (missing.length > 0) {
-    if (batch.length === 1 || depth >= 6) {
-      // Can't split further (or gone deep enough) — leave these missing; caller falls back
-      // to the original Chinese text for any id still absent from the returned map.
-      return result;
-    }
-    const mid = Math.ceil(missing.length / 2);
-    const subA = missing.slice(0, mid);
-    const subB = missing.slice(mid);
-    const [resA, resB] = await Promise.all([
-      translateBatch(subA, contextTail, apiKey, depth + 1),
-      translateBatch(subB, contextTail, apiKey, depth + 1),
-    ]);
-    Object.assign(result, resA, resB);
-  }
-
-  return result;
-}
-
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
@@ -231,9 +77,6 @@ export default async function handler(req, res) {
     whisperForm.append('model', 'whisper-large-v3');
     whisperForm.append('response_format', 'verbose_json');
     whisperForm.append('language', 'zh');
-    whisperForm.append('timestamp_granularities[]', 'segment');
-    whisperForm.append('timestamp_granularities[]', 'word');
-    whisperForm.append('temperature', '0');
 
     const transcribeRes = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
       method: 'POST',
@@ -247,89 +90,82 @@ export default async function handler(req, res) {
     }
 
     const transcription = await transcribeRes.json();
-    const rawSegments = transcription.segments || [];
-    const words = transcription.words || [];
+    const segments = transcription.segments || [];
 
-    if (rawSegments.length === 0) {
+    if (segments.length === 0) {
       return res.status(422).json({ error: 'រកមិនឃើញសំឡេងនិយាយនៅក្នុងឯកសារនេះទេ' });
     }
 
-    // Group words under the (full-sentence) Whisper segment they fall within, so we can
-    // translate at the sentence level (context intact) while still building short,
-    // silence-aware display lines from each sentence's own words afterward.
-    let wordCursor = 0;
-    const sentenceWordGroups = rawSegments.map((seg) => {
-      const group = [];
-      while (wordCursor < words.length && words[wordCursor].start < seg.end + 0.05) {
-        if (words[wordCursor].start >= seg.start - 0.05) group.push(words[wordCursor]);
-        wordCursor++;
+    // ---- Step 2: Translate each segment (Chinese -> Khmer) in batches ----
+    const BATCH_SIZE = 12;
+    const translations = {};
+
+    for (let i = 0; i < segments.length; i += BATCH_SIZE) {
+      const batch = segments
+        .slice(i, i + BATCH_SIZE)
+        .map((s) => ({ id: s.id, text: s.text.trim() }));
+
+      const prompt =
+        'You are a professional Chinese-to-Khmer subtitle translator. ' +
+        'Translate the "text" field of each item below from Chinese to natural, fluent Khmer ' +
+        'suitable for TV/movie subtitles. Keep the same meaning, tone, and length appropriate for subtitles. ' +
+        'Return ONLY a JSON array, same order, same "id" values, each item shaped as {"id": <id>, "khmer": "<translation>"}. ' +
+        'No explanation, no markdown fences, JSON only.\n\n' +
+        `Input:\n${JSON.stringify(batch)}`;
+
+      const chatRes = await fetchWithRetry(() =>
+        fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: 'openai/gpt-oss-120b',
+            messages: [{ role: 'user', content: prompt }],
+            temperature: 0.2,
+          }),
+        })
+      );
+
+      if (!chatRes.ok) {
+        const errText = await chatRes.text();
+        return res.status(502).json({ error: `កំហុសពី Translation API: ${errText}` });
       }
-      return group;
-    });
 
-    // ---- Step 2: Translate FULL SENTENCES (Chinese -> Khmer) in batches, with rolling
-    // context from the previous batch so names/pronouns/tone stay consistent across the story ----
-    const BATCH_SIZE = 10;
-    const translations = {}; // keyed by rawSegments index
-    let contextTail = []; // last few {zh, km} pairs, for continuity only
+      const chatData = await chatRes.json();
+      let content = chatData.choices[0].message.content.trim();
+      content = content.replace(/^```json\s*/i, '').replace(/```$/, '').trim();
 
-    for (let i = 0; i < rawSegments.length; i += BATCH_SIZE) {
-      const batchSegs = rawSegments.slice(i, i + BATCH_SIZE);
-      const batch = batchSegs.map((s, j) => ({ id: i + j, text: s.text.trim() }));
+      let parsed;
+      try {
+        parsed = JSON.parse(content);
+      } catch (e) {
+        const match = content.match(/\[[\s\S]*\]/);
+        parsed = match ? JSON.parse(match[0]) : [];
+      }
 
-      const batchResult = await translateBatch(batch, contextTail, apiKey);
-      Object.assign(translations, batchResult);
-
-      // Carry the last 3 sentences of this batch forward as context for the next one.
-      contextTail = batchSegs.slice(-3).map((s, k) => {
-        const idx = i + batchSegs.length - Math.min(3, batchSegs.length) + k;
-        return { zh: s.text.trim(), km: translations[idx] || '' };
-      });
+      for (const item of parsed) {
+        translations[item.id] = item.khmer;
+      }
     }
 
-    // ---- Step 3: Build short, silence-aware subtitle lines, distributing each sentence's
-    // already-translated Khmer text across its own sub-lines (never crossing sentence bounds) ----
-    const outputLines = [];
-
-    rawSegments.forEach((seg, idx) => {
-      const khmerFull = (translations[idx] || seg.text).trim();
-      const wordGroup = sentenceWordGroups[idx];
-
-      const subLines = wordGroup && wordGroup.length > 0 ? buildLinesFromWords(wordGroup) : null;
-
-      if (!subLines || subLines.length === 0) {
-        outputLines.push({ text: khmerFull, start: seg.start, end: seg.end, original: seg.text.trim() });
-        return;
-      }
-
-      const originalTexts = subLines.map((l) => l.text);
-      const khmerParts = splitTranslationAcrossLines(khmerFull, originalTexts);
-
-      subLines.forEach((line, k) => {
-        outputLines.push({
-          text: khmerParts[k] || (k === 0 ? khmerFull : ''),
-          start: line.start,
-          end: line.end,
-          original: line.text,
-        });
-      });
-    });
-
-    // ---- Step 4: Build the .srt file ----
+    // ---- Step 3: Build the .srt file ----
     let srt = '';
-    outputLines.forEach((line, idx) => {
+    segments.forEach((seg, idx) => {
+      const khmerText = translations[seg.id] || seg.text;
       srt += `${idx + 1}\n`;
-      srt += `${formatTimestamp(line.start)} --> ${formatTimestamp(line.end)}\n`;
-      srt += `${line.text}\n\n`;
+      srt += `${formatTimestamp(seg.start)} --> ${formatTimestamp(seg.end)}\n`;
+      srt += `${khmerText}\n\n`;
     });
 
     return res.status(200).json({
       srt,
-      segments: outputLines.map((l) => ({
-        start: l.start,
-        end: l.end,
-        original: l.original,
-        khmer: l.text,
+      segments: segments.map((s) => ({
+        start: s.start,
+        end: s.end,
+        original: s.text,
+        khmer: translations[s.id] || '',
       })),
     });
   } catch (err) {
