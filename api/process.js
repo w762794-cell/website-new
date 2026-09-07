@@ -77,6 +77,7 @@ export default async function handler(req, res) {
     whisperForm.append('model', 'whisper-large-v3');
     whisperForm.append('response_format', 'verbose_json');
     whisperForm.append('language', 'zh');
+    whisperForm.append('temperature', '0');
 
     const transcribeRes = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
       method: 'POST',
