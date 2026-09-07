@@ -97,7 +97,7 @@
       <div class="filename" id="filename"></div>
       <input type="file" id="fileInput" accept=".mp3,audio/mpeg" />
     </div>
-    <p class="hint">ទទួលបានរហូតដល់ ~20 នាទី (ប្រព័ន្ធនឹងបង្រួម audio ស្វ័យប្រវត្តិមុនផ្ញើ)</p>
+    <p class="hint">ទទួលបានរហូតដល់ ~១៥-២០ នាទី (ប្រព័ន្ធនឹងបង្រួម audio ស្វ័យប្រវត្តិមុនផ្ញើ)</p>
     <button id="submitBtn" disabled>បំលែងឥឡូវនេះ</button>
     <div class="status" id="status"></div>
     <div class="error" id="error"></div>
@@ -152,76 +152,48 @@ function setFile(file) {
   resultCard.style.display = 'none';
 }
 
-// Decode + downsample to 16kHz mono + re-encode at low bitrate, entirely in the browser.
-// Decoding is done in small chunks (not the whole file at once) so long recordings don't
-// blow up memory and crash the browser tab on mobile — this is what let long files fail before.
-async function compressAudioForUpload(file, onProgress) {
-  if (typeof lamejs === 'undefined') {
-    throw new Error('lamejs library មិនទាន់ load (សូមពិនិត្យ internet connection រួច reload ទំព័រ)');
-  }
-
-  const fullBuffer = await file.arrayBuffer();
+// Decode + downsample to 16kHz mono + re-encode at low bitrate, entirely in the browser,
+// so long recordings still fit under Vercel's ~4.4MB upload limit.
+async function compressAudioForUpload(file) {
+  const arrayBuffer = await file.arrayBuffer();
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  const tempCtx = new AudioCtx();
+  let audioBuffer;
+  try {
+    audioBuffer = await tempCtx.decodeAudioData(arrayBuffer);
+  } finally {
+    tempCtx.close();
+  }
 
   const TARGET_SAMPLE_RATE = 16000;
-  const TARGET_BITRATE_KBPS = 24; // ~24 min fits under Vercel's ~4.3MB budget at this rate
-  const CHUNK_BYTES = 1_000_000; // ~1MB of raw mp3 per decode pass (bounds memory use)
-  const blockSize = 1152;
+  const TARGET_BITRATE_KBPS = 24;
 
-  const mp3Encoder = new lamejs.Mp3Encoder(1, TARGET_SAMPLE_RATE, TARGET_BITRATE_KBPS);
-  const mp3Chunks = [];
-  const totalBytes = fullBuffer.byteLength;
-  let offset = 0;
+  const offlineCtx = new OfflineAudioContext(
+    1,
+    Math.ceil(audioBuffer.duration * TARGET_SAMPLE_RATE),
+    TARGET_SAMPLE_RATE
+  );
+  const source = offlineCtx.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(offlineCtx.destination);
+  source.start(0);
+  const rendered = await offlineCtx.startRendering();
 
-  while (offset < totalBytes) {
-    const end = Math.min(offset + CHUNK_BYTES, totalBytes);
-
-    // mp3 frames are self-syncing, so decoding independent ~1MB slices works; if a slice's
-    // start doesn't land on a clean frame boundary, nudge forward a few bytes and retry.
-    let audioBuffer = null;
-    for (let nudge = 0; nudge <= 64 && !audioBuffer; nudge++) {
-      try {
-        const tempCtx = new AudioCtx();
-        const trySlice = fullBuffer.slice(offset + nudge, end);
-        audioBuffer = await tempCtx.decodeAudioData(trySlice);
-        tempCtx.close();
-      } catch (e) {
-        audioBuffer = null;
-      }
-    }
-
-    if (audioBuffer) {
-      const offlineCtx = new OfflineAudioContext(
-        1,
-        Math.max(1, Math.ceil(audioBuffer.duration * TARGET_SAMPLE_RATE)),
-        TARGET_SAMPLE_RATE
-      );
-      const source = offlineCtx.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(offlineCtx.destination);
-      source.start(0);
-      const rendered = await offlineCtx.startRendering();
-
-      const channelData = rendered.getChannelData(0);
-      const samples = new Int16Array(channelData.length);
-      for (let i = 0; i < channelData.length; i++) {
-        const s = Math.max(-1, Math.min(1, channelData[i]));
-        samples[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-      }
-
-      for (let i = 0; i < samples.length; i += blockSize) {
-        const chunk = samples.subarray(i, i + blockSize);
-        const buf = mp3Encoder.encodeBuffer(chunk);
-        if (buf.length > 0) mp3Chunks.push(buf);
-      }
-    }
-    // If a slice truly can't be decoded, it's skipped (a tiny gap) rather than failing the
-    // whole upload — acceptable since this audio is only used for transcription, not playback.
-
-    offset = end;
-    if (onProgress) onProgress(offset / totalBytes);
+  const channelData = rendered.getChannelData(0);
+  const samples = new Int16Array(channelData.length);
+  for (let i = 0; i < channelData.length; i++) {
+    const s = Math.max(-1, Math.min(1, channelData[i]));
+    samples[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
   }
 
+  const mp3Encoder = new lamejs.Mp3Encoder(1, TARGET_SAMPLE_RATE, TARGET_BITRATE_KBPS);
+  const blockSize = 1152;
+  const mp3Chunks = [];
+  for (let i = 0; i < samples.length; i += blockSize) {
+    const chunk = samples.subarray(i, i + blockSize);
+    const buf = mp3Encoder.encodeBuffer(chunk);
+    if (buf.length > 0) mp3Chunks.push(buf);
+  }
   const finalBuf = mp3Encoder.flush();
   if (finalBuf.length > 0) mp3Chunks.push(finalBuf);
 
@@ -236,11 +208,9 @@ submitBtn.addEventListener('click', async () => {
 
   let uploadBlob;
   try {
-    uploadBlob = await compressAudioForUpload(selectedFile, (fraction) => {
-      statusEl.textContent = `កំពុងបង្រួម audio... ${Math.round(fraction * 100)}%`;
-    });
+    uploadBlob = await compressAudioForUpload(selectedFile);
   } catch (compressErr) {
-    errorEl.textContent = `កំហុសពេលបង្រួម audio (${compressErr.name}): ${compressErr.message} — សូមសាកល្បងឯកសារផ្សេង ឬខ្លីជាងនេះ`;
+    errorEl.textContent = 'កំហុសពេលបង្រួម audio: ' + compressErr.message + ' — សូមសាកល្បងឯកសារផ្សេង ឬខ្លីជាងនេះ';
     statusEl.textContent = '';
     submitBtn.disabled = false;
     return;
@@ -258,34 +228,14 @@ submitBtn.addEventListener('click', async () => {
   const formData = new FormData();
   formData.append('audio', uploadBlob, 'audio.mp3');
 
-  let res;
   try {
-    res = await fetch('/api/process', { method: 'POST', body: formData });
-  } catch (networkErr) {
-    errorEl.textContent = `កំហុសពេលភ្ជាប់ទៅ server (network): ${networkErr.name}: ${networkErr.message}`;
-    statusEl.textContent = '';
-    submitBtn.disabled = false;
-    return;
-  }
+    const res = await fetch('/api/process', { method: 'POST', body: formData });
+    const data = await res.json();
 
-  let data;
-  try {
-    data = await res.json();
-  } catch (parseErr) {
-    errorEl.textContent = `កំហុសពេលអាន response ពី server (HTTP ${res.status}): ${parseErr.name}: ${parseErr.message}`;
-    statusEl.textContent = '';
-    submitBtn.disabled = false;
-    return;
-  }
+    if (!res.ok) {
+      throw new Error(data.error || 'មានបញ្ហាមិនស្គាល់មូលហេតុកើតឡើង');
+    }
 
-  if (!res.ok) {
-    errorEl.textContent = `កំហុសពី server (HTTP ${res.status}): ${data.error || 'មិនស្គាល់មូលហេតុ'}`;
-    statusEl.textContent = '';
-    submitBtn.disabled = false;
-    return;
-  }
-
-  try {
     statusEl.textContent = 'រួចរាល់!';
     const blob = new Blob([data.srt], { type: 'text/plain;charset=utf-8' });
     downloadLink.href = URL.createObjectURL(blob);
@@ -303,8 +253,8 @@ submitBtn.addEventListener('click', async () => {
     });
 
     resultCard.style.display = 'block';
-  } catch (renderErr) {
-    errorEl.textContent = `កំហុសពេលបង្ហាញលទ្ធផល: ${renderErr.name}: ${renderErr.message}`;
+  } catch (err) {
+    errorEl.textContent = 'កំហុស: ' + err.message;
     statusEl.textContent = '';
   } finally {
     submitBtn.disabled = false;
